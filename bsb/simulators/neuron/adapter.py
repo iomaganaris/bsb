@@ -245,14 +245,17 @@ class NeuronAdapter(SimulatorAdapter):
 
         simulator.dt = self.resolution
         simulator.celsius = self.temperature
-        simulator.tstop = self.duration
-        if self.coreneuron:
+        simulator.tstop = int(os.getenv('SIMULATION_TSTOP', self.duration))
+        # if self.coreneuron:
+        if os.getenv('NEURON_SIMULATOR') == "CORENEURON":
             print(f"ENABLING CORENEURON !!! GPU: {self.gpu}")
             simulator.CVode().cache_efficient(1)
             from neuron import coreneuron
 
             coreneuron.enable = True
-            coreneuron.gpu = self.gpu
+            coreneuron.gpu = True
+        else:
+            self.coreneuron = False
 
         t = t0 = time()
         self.load_balance()
@@ -356,16 +359,45 @@ class NeuronAdapter(SimulatorAdapter):
         report("Simulating...", level=2)
         pc.set_maxstep(10)
         simulator.finitialize(self.initial)
-        progression = 0
-        self.start_progress(self.duration)
-        for oi, i in self.step_progress(self.duration, 1):
-            t = time.time()
-            pc.psolve(i)
-            pc.barrier()
-            self.progress(i)
-            if os.path.exists("interrupt_neuron"):
-                report("Iterrupt requested. Stopping simulation.", level=1)
-                break
+        self.duration = simulator.tstop
+        spike_vecs = []
+        #print(self.node_cells)
+        print(self.cells.keys())
+        #for gid in self.cells.keys():
+        for _, gid in self.transmitter_map.items():
+            if pc.gid_exists(gid) == 3:
+                spikevec, idvec = (neuron.h.Vector(), neuron.h.Vector())
+                pc.spike_record(gid, spikevec, idvec)
+                spike_vecs.append((spikevec, idvec))
+        print("Node {} set up {} spike records".format(pc.id(), len(spike_vecs)))
+        start = time.time()
+        if self.coreneuron:
+            pc.psolve(simulator.tstop)
+        else:
+            progression = 0
+            self.start_progress(self.duration)
+            for oi, i in self.step_progress(self.duration, 1):
+                t = time.time()
+                pc.psolve(i)
+                pc.barrier()
+                self.progress(i)
+                if os.path.exists("interrupt_neuron"):
+                    report("Iterrupt requested. Stopping simulation.", level=1)
+                    break
+        end = time.time()
+        print("psolve time: {}".format(end - start))
+        spikes_num = 0
+        spike_filename = 'spikes_{}_{}.txt'.format(pc.id(), "corenrn" if os.getenv('NEURON_SIMULATOR') == "CORENEURON" else "nrn")
+        if os.path.isfile(spike_filename):
+            os.remove(spike_filename)
+        for spikevec, idvec in spike_vecs:
+            spikes_num += spikevec.size()
+            with open(spike_filename, 'a') as f:
+                for stime, gid in zip(spikevec.to_python(), idvec.to_python()):
+                    # print("{}\t{}".format(stime, gid))
+                    f.write("{:.3f}\t{}\n".format(stime, int(gid)))
+        pc.allreduce(spikes_num, 1)
+        print("Number of spikes: {}".format(spikes_num))
         report("Finished simulation.", level=2)
 
     def collect_output(self, simulator):
