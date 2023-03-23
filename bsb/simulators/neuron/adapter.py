@@ -21,6 +21,7 @@ import time
 
 try:
     import neuron
+    from neuron import h, gui
 
     _has_neuron = True
 except ImportError:
@@ -245,15 +246,15 @@ class NeuronAdapter(SimulatorAdapter):
 
         simulator.dt = self.resolution
         simulator.celsius = self.temperature
-        simulator.tstop = int(os.getenv('SIMULATION_TSTOP', self.duration))
+        simulator.tstop = float(os.getenv('SIMULATION_TSTOP', self.duration))
         # if self.coreneuron:
         if os.getenv('NEURON_SIMULATOR') == "CORENEURON":
-            print(f"ENABLING CORENEURON !!! GPU: {self.gpu}")
+            print(f"ENABLING CORENEURON !!! GPU: {os.getenv('SIMULATION_BACKEND', 'CPU') == 'GPU'}")
             simulator.CVode().cache_efficient(1)
             from neuron import coreneuron
 
             coreneuron.enable = True
-            coreneuron.gpu = True
+            coreneuron.gpu = os.getenv('SIMULATION_BACKEND', 'CPU') == 'GPU'
         else:
             self.coreneuron = False
 
@@ -358,18 +359,34 @@ class NeuronAdapter(SimulatorAdapter):
         pc.barrier()
         report("Simulating...", level=2)
         pc.set_maxstep(10)
-        simulator.finitialize(self.initial)
         self.duration = simulator.tstop
         spike_vecs = []
+        voltage_vecs = []
         #print(self.node_cells)
-        print(self.cells.keys())
+        # print(self.cells.keys())
         #for gid in self.cells.keys():
         for _, gid in self.transmitter_map.items():
             if pc.gid_exists(gid) == 3:
                 spikevec, idvec = (neuron.h.Vector(), neuron.h.Vector())
                 pc.spike_record(gid, spikevec, idvec)
                 spike_vecs.append((spikevec, idvec))
+                if os.getenv('VRECORDGID') is not None and gid == int(os.getenv('VRECORDGID')):
+                    if gid in self.cells:
+                        print("Adding voltage record for gid {}".format(gid))
+                        print(self.cells[gid].soma[0](0.5)._ref_v)
+                        # import pdb
+                        # pdb.set_trace()
+                        voltage_rec = neuron.h.Vector(40000)
+                        voltage_rec.record(self.cells[gid].soma[0]._neuron_ptr(0.5)._ref_v)
+                        voltage_vecs.append((gid, voltage_rec))
         print("Node {} set up {} spike records".format(pc.id(), len(spike_vecs)))
+        simulator.finitialize(self.initial)
+        if os.getenv('PRCELLSTATEGID') is not None:
+            gid = int(os.getenv('PRCELLSTATEGID'))
+            if pc.gid_exists(gid) == 3:
+                print("Enabling prcellstate for gid {}. Cell type: {}".format(gid, self.cells[gid].cell_model.name))
+                pc.prcellstate(gid, 'after_init_{}'.format("corenrn" if os.getenv('NEURON_SIMULATOR') == "CORENEURON" else "nrn"))
+                
         start = time.time()
         if self.coreneuron:
             pc.psolve(simulator.tstop)
@@ -386,6 +403,10 @@ class NeuronAdapter(SimulatorAdapter):
                     break
         end = time.time()
         print("psolve time: {}".format(end - start))
+        if os.getenv('PRCELLSTATEGID') is not None:
+            gid = int(os.getenv('PRCELLSTATEGID'))
+            if pc.gid_exists(gid):
+                pc.prcellstate(gid, 'after_psolve_{}_{}'.format(simulator.tstop, "corenrn" if os.getenv('NEURON_SIMULATOR') == "CORENEURON" else "nrn"))
         spikes_num = 0
         spike_filename = 'spikes_{}_{}.txt'.format(pc.id(), "corenrn" if os.getenv('NEURON_SIMULATOR') == "CORENEURON" else "nrn")
         if os.path.isfile(spike_filename):
@@ -398,6 +419,14 @@ class NeuronAdapter(SimulatorAdapter):
                     f.write("{:.3f}\t{}\n".format(stime, int(gid)))
         pc.allreduce(spikes_num, 1)
         print("Number of spikes: {}".format(spikes_num))
+        for gid, v_vec in voltage_vecs:
+            voltage_filename = 'voltage_{}_{}.txt'.format(gid, "corenrn" if os.getenv('NEURON_SIMULATOR') == "CORENEURON" else "nrn")
+            print(voltage_rec)
+            print(voltage_rec.to_python())
+            print(self.cells[gid].soma[0]._neuron_ptr(0.5)._ref_v[0])
+            with open(voltage_filename, 'w') as f:
+                for v in v_vec:
+                    f.write("{}\n".format(v))
         report("Finished simulation.", level=2)
 
     def collect_output(self, simulator):
